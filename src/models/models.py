@@ -20,6 +20,7 @@ from src.data.datamodules import CelebDataModule
 
 logger = logging.getLogger(__name__)
 
+LAMBDA_GP = 10
 
 class WGANModule(pl.LightningModule):
     """PyTorch-Lightning module for classification"""
@@ -29,23 +30,44 @@ class WGANModule(pl.LightningModule):
         learning_rate=2e-5,
     ):
         super().__init__()
+        self.automatic_optimization = False
+
         self.lr = learning_rate
         self.save_hyperparameters()
         self.writer = SummaryWriter("logs")
         self.epoch_idx = 0
+        self.critic_iterations = 5
 
         self.generator = Generator()
         self.generator.apply(weights_init)
-        self.discriminator = Discriminator()
-        self.discriminator.apply(weights_init)
+        self.critic = Discriminator()
+        self.critic.apply(weights_init)
 
     def forward(self, z):
         return self.generator(z)
 
     def training_step(self, batch, batch_idx, optimizer_idx):
+        (opt_g, opt_d), _= self.optimizers()
         images_real, noise= batch
-        G_output_fake = self.generator(noise)
 
+        for _ in range(self.critic_iterations):
+            G_output_fake = self.generator(noise)
+            critic_output_real = self.critic(images_real).view(-1)
+            critic_output_fake = self.critic(G_output_fake).view(-1)
+            gp = gradient_penalty(self.critic, critic_output_real, critic_output_fake, device="cuda")
+            loss_critic = (-(torch.mean(critic_output_real) - torch.mean(critic_output_fake)) + LAMBDA_GP * gp)
+
+            self.critic.zero_grad()
+            loss_critic.backward(retain_graph=True)
+            opt_d.step()
+
+        gen_fake = self.critic(G_output_fake).view(-1)
+        loss_gen = -torch.mean(gen_fake)
+        self.generator.zero_grad()
+        loss_gen.backward()
+        opt_g.step()
+
+        '''
         # train discriminator
         if optimizer_idx == 1:
             D_output_real = self.discriminator(images_real).view(-1)
@@ -64,17 +86,18 @@ class WGANModule(pl.LightningModule):
             G_loss = F.binary_cross_entropy(D_output.float(), torch.ones_like(D_output).float())
             self.log("G_loss", G_loss, logger=True)
             return G_loss
+        '''
 
     def training_epoch_end(self, outputs):
         with torch.no_grad():
-            output_fake = self.generator(torch.randn(32, 100, 1, 1, device="cpu"))
+            output_fake = self.generator(torch.randn(32, 100, 1, 1, device="cuda:0"))
             grid = torchvision.utils.make_grid(output_fake, normalize=True)
             self.writer.add_image("Fake images", grid, global_step=self.epoch_idx)
             self.epoch_idx += 1
 
     def configure_optimizers(self):
-        opt_g = torch.optim.Adam(self.generator.parameters(), lr=self.lr, betas=(0.5, 0.999))
-        opt_d = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr, betas=(0.5, 0.999))
+        opt_g = torch.optim.Adam(self.generator.parameters(), lr=self.lr, betas=(0.0, 0.9))
+        opt_d = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr, betas=(0.0, 0.9))
         return [opt_g, opt_d], []
 
 
@@ -122,19 +145,18 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf) x 32 x 32
             nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 2),
+            nn.InstanceNorm2d(ndf * 2, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf*2) x 16 x 16
             nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 4),
+            nn.InstanceNorm2d(ndf * 4, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf*4) x 8 x 8
             nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 8),
+            nn.InstanceNorm2d(ndf * 8, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf*8) x 4 x 4
             nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
-            nn.Sigmoid()
         )
 
     def forward(self, input):
@@ -148,6 +170,28 @@ def weights_init(m):
     elif classname.find('BatchNorm') != -1:
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
+
+
+def gradient_penalty(critic, real, fake, device="cuda"):
+    BATCH_SIZE, C, H, W = real.shape
+    alpha = torch.rand((BATCH_SIZE, 1, 1, 1)).repeat(1, C, H, W).to(device)
+    interpolated_images = real * alpha + fake * (1 - alpha)
+
+    # Calculate critic scores
+    mixed_scores = critic(interpolated_images)
+
+    # Take the gradient of the scores with respect to the images
+    gradient = torch.autograd.grad(
+        inputs=interpolated_images,
+        outputs=mixed_scores,
+        grad_outputs=torch.ones_like(mixed_scores),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    gradient = gradient.view(gradient.shape[0], -1)
+    gradient_norm = gradient.norm(2, dim=1)
+    gradient_penalty = torch.mean((gradient_norm - 1) ** 2)
+    return gradient_penalty
 
 
 def configure_trainer(
