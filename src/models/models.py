@@ -54,7 +54,7 @@ class WGANModule(pl.LightningModule):
             G_output_fake = self.generator(noise)
             critic_output_real = self.critic(images_real).view(-1)
             critic_output_fake = self.critic(G_output_fake).view(-1)
-            gp = gradient_penalty(self.critic, critic_output_real, critic_output_fake, device="cuda")
+            gp = gradient_penalty(self.critic, images_real, G_output_fake, device="cuda")
             loss_critic = (-(torch.mean(critic_output_real) - torch.mean(critic_output_fake)) + LAMBDA_GP * gp)
 
             self.critic.zero_grad()
@@ -90,14 +90,14 @@ class WGANModule(pl.LightningModule):
 
     def training_epoch_end(self, outputs):
         with torch.no_grad():
-            output_fake = self.generator(torch.randn(32, 100, 1, 1, device="cuda:0"))
+            output_fake = self.generator(torch.randn(32, 100, 1, 1, device="cuda"))
             grid = torchvision.utils.make_grid(output_fake, normalize=True)
             self.writer.add_image("Fake images", grid, global_step=self.epoch_idx)
             self.epoch_idx += 1
 
     def configure_optimizers(self):
         opt_g = torch.optim.Adam(self.generator.parameters(), lr=self.lr, betas=(0.0, 0.9))
-        opt_d = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr, betas=(0.0, 0.9))
+        opt_d = torch.optim.Adam(self.critic.parameters(), lr=self.lr, betas=(0.0, 0.9))
         return [opt_g, opt_d], []
 
 
