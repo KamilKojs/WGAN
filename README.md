@@ -1,1 +1,3 @@
 # WGAN
+
+![](wgan.gif)
